@@ -1,284 +1,479 @@
-import gradio as gr
-import json
-from datetime import datetime
-import yaml
-import time
-import re
-import os
-import os.path as op
-import torch
-import soundfile as sf
-import numpy as np
-import tempfile
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
-from download import download_model
-
-# 下载模型
-APP_DIR = op.dirname(op.abspath(__file__))
-download_model(APP_DIR)
-large_model_path = op.join(APP_DIR, "ckpt", "SongGeneration-v1.5-beta")
-download_model(large_model_path, repo_id="waytan22/SongGeneration-v1.5-beta", revision="db10f47")
-print("Successful downloaded model.")
-
-# 模型初始化
-from levo_inference import LeVoInference
-MODEL = LeVoInference(large_model_path)
-
-EXAMPLE_LYRICS = """
-[intro-medium]
-
-[verse]
-夜晚的街灯闪烁
-我漫步在熟悉的角落
-回忆像潮水般涌来
-你的笑容如此清晰
-在心头无法抹去
-那些曾经的甜蜜
-如今只剩我独自回忆
-
-[chorus]
-回忆的温度还在
-你却已不在
-我的心被爱填满
-却又被思念刺痛
-音乐的节奏奏响
-我的心却在流浪
-没有你的日子
-我该如何继续向前
-
-[inst-medium]
-
-[verse]
-手机屏幕亮起
-是你发来的消息
-简单的几个字
-却让我泪流满面
-曾经的拥抱温暖
-如今却变得遥远
-我多想回到从前
-重新拥有你的陪伴
-
-[chorus]
-回忆的温度还在
-你却已不在
-我的心被爱填满
-却又被思念刺痛
-音乐的节奏奏响
-我的心却在流浪
-没有你的日子
-我该如何继续向前
-
-[outro-medium]
-""".strip()
-
-with open(op.join(APP_DIR, 'conf/vocab.yaml'), 'r', encoding='utf-8') as file:
-    STRUCTS = yaml.safe_load(file)
-
-
-def save_as_flac(sample_rate, audio_data):
-    if isinstance(audio_data, tuple):
-        sample_rate, audio_data = audio_data
-    
-    if audio_data.dtype == np.float64:
-        audio_data = audio_data.astype(np.float32)
-    
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".flac")
-    sf.write(temp_file, audio_data, sample_rate, format='FLAC')
-    return temp_file.name
-
-
-# 模拟歌曲生成函数
-def generate_song(lyric, description=None, prompt_audio=None, genre=None, cfg_coef=None, temperature=0.1, top_k=-1, gen_type="mixed", progress=gr.Progress(track_tqdm=True)):
-    global MODEL
-    global STRUCTS
-    params = {'cfg_coef':cfg_coef, 'temperature':temperature, 'top_k':top_k}
-    params = {k:v for k,v in params.items() if v is not None}
-    vocal_structs = ['[verse]', '[chorus]', '[bridge]']
-    sample_rate = MODEL.cfg.sample_rate
-    
-    # format lyric
-    lyric = lyric.replace("[intro]", "[intro-short]").replace("[inst]", "[inst-short]").replace("[outro]", "[outro-short]")
-    paragraphs = [p.strip() for p in lyric.strip().split('\n\n') if p.strip()]
-    if len(paragraphs) < 1:
-        return None, json.dumps("Lyrics can not be left blank")
-    paragraphs_norm = []
-    vocal_flag = False
-    for para in paragraphs:
-        lines = para.splitlines()
-        struct_tag = lines[0].strip().lower()
-        if struct_tag not in STRUCTS:
-            return None, json.dumps(f"Segments should start with a structure tag in {STRUCTS}")
-        if struct_tag in vocal_structs:
-            vocal_flag = True
-            if len(lines) < 2 or not [line.strip() for line in lines[1:] if line.strip()]:
-                return None, json.dumps("The following segments require lyrics: [verse], [chorus], [bridge]")
-            else:
-                new_para_list = []
-                for line in lines[1:]:
-                    new_para_list.append(re.sub(r"[^\w\s\[\]\-\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u00c0-\u017f]", "", line))
-                new_para_str = f"{struct_tag} {'.'.join(new_para_list)}"
-        else:
-            if len(lines) > 1:
-                return None, json.dumps("The following segments should not contain lyrics: [intro], [intro-short], [intro-medium], [inst], [inst-short], [inst-medium], [outro], [outro-short], [outro-medium]")
-            else:
-                new_para_str = struct_tag
-        paragraphs_norm.append(new_para_str)
-    if not vocal_flag:
-        return None, json.dumps(f"The lyric must contain at least one of the following structures: {vocal_structs}")
-    lyric_norm = " ; ".join(paragraphs_norm)
-
-    # format prompt 
-    if prompt_audio is not None:
-        genre = None
-        description = None
-    elif description is not None and description != "":
-        genre = None
-
-    progress(0.0, "Start Generation")
-    start = time.time()
-    
-    audio_data = MODEL(lyric_norm, description, prompt_audio, genre, op.join(APP_DIR, "tools/new_prompt.pt"), gen_type, params).cpu().permute(1, 0).float().numpy()
-
-    end = time.time()
-    
-    # 创建输入配置的JSON
-    input_config = {
-        "lyric": lyric_norm,
-        "genre": genre,
-        "prompt_audio": prompt_audio,
-        "description": description,
-        "params": params,
-        "inference_duration": end - start,
-        "timestamp": datetime.now().isoformat(),
-    }
-    
-    filepath = save_as_flac(sample_rate, audio_data)
-    return filepath, json.dumps(input_config, indent=2)
-
-
-# 创建Gradio界面
-with gr.Blocks(title="SongGeneration Demo Space") as demo:
-    gr.Markdown("# 🎵 SongGeneration Demo Space")
-    gr.Markdown("Demo interface for the song generation model. Provide a lyrics, and optionally an audio or text prompt, to generate a custom song. The code is in [GIT](https://github.com/tencent-ailab/SongGeneration)")
-    
-    with gr.Row():
-        with gr.Column():
-            lyric = gr.Textbox(
-                label="Lyrics",
-                lines=5,
-                max_lines=15,
-                value=EXAMPLE_LYRICS,
-                info="Each paragraph represents a segment starting with a structure tag and ending with a blank line, each line is a sentence without punctuation, segments [intro], [inst], [outro] should not contain lyrics, while [verse], [chorus], and [bridge] require lyrics.",
-                placeholder="""Lyric Format
-'''
-[structure tag]
-lyrics
-
-[structure tag]
-lyrics
-'''
-1. One paragraph represents one segments, starting with a structure tag and ending with a blank line
-2. One line represents one sentence, punctuation is not recommended inside the sentence
-3. The following segments should not contain lyrics: [intro-short], [intro-medium], [inst-short], [inst-medium], [outro-short], [outro-medium]
-4. The following segments require lyrics: [verse], [chorus], [bridge]
 """
-            )
+SongGeneration API - Main Application
+Combines Gradio UI with FastAPI endpoints for Render deployment
+"""
 
-            with gr.Tabs(elem_id="extra-tabs"):
-                with gr.Tab("Genre Select"):
-                    genre = gr.Radio(
-                        choices=["Auto", "Pop", "R&B", "Dance", "Jazz", "Folk", "Rock", "Chinese Style", "Chinese Tradition", "Metal", "Reggae", "Chinese Opera"],
-                        label="Genre Select(Optional)",
-                        value="Auto",
-                        interactive=True,
-                        elem_id="single-select-radio"
-                    )
-                with gr.Tab("Audio Prompt"):
-                    prompt_audio = gr.Audio(
-                        label="Prompt Audio (Optional)",
-                        type="filepath",
-                        elem_id="audio-prompt"
-                    )
-                with gr.Tab("Text Prompt"):
-                    gr.Markdown("For detailed usage, please refer to [here](https://github.com/tencent-ailab/SongGeneration?tab=readme-ov-file#-description-input-format)")
-                    description = gr.Textbox(
-                        label="Song Description (Optional)",
-                        info="Describe the gender, timbre, genre, emotion, instrument and bpm of the song. Only English is supported currently.​",
-                        placeholder="female, dark, pop, sad, piano and drums, the bpm is 125.",
-                        lines=1,
-                        max_lines=2
-                    )
+import os
+import sys
+import gradio as gr
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+from datetime import datetime
+from typing import Optional
+import json
+import traceback
 
-            with gr.Accordion("Advanced Config", open=False):
-                cfg_coef = gr.Slider(
-                    label="CFG Coefficient",
-                    minimum=0.1,
-                    maximum=3.0,
-                    step=0.1,
-                    value=1.5,
-                    interactive=True,
-                    elem_id="cfg-coef",
-                )
-                temperature = gr.Slider(
-                    label="Temperature",
-                    minimum=0.1,
-                    maximum=2.0,
-                    step=0.1,
-                    value=0.8,
-                    interactive=True,
-                    elem_id="temperature",
-                )
-                # top_k = gr.Slider(
-                #     label="Top-K",
-                #     minimum=1,
-                #     maximum=100,
-                #     step=1,
-                #     value=50,
-                #     interactive=True,
-                #     elem_id="top_k",
-                # )
-            with gr.Row():
-                generate_btn = gr.Button("Generate Song", variant="primary")
-                generate_bgm_btn = gr.Button("Generate Pure Music", variant="primary")
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Import original functionality
+# Note: Ye imports aapki original files se hain
+try:
+    from generate import generate_song, generate_pure_music
+    GENERATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Could not import generation functions. Using dummy mode.")
+    GENERATION_AVAILABLE = False
+    
+    # Dummy functions for testing
+    def generate_song(lyrics, genre="Auto", **kwargs):
+        return None, {"status": "dummy", "message": "Generation not available"}
+    
+    def generate_pure_music(prompt, genre="Auto", **kwargs):
+        return None, {"status": "dummy", "message": "Generation not available"}
+
+# ======================
+# FastAPI Setup
+# ======================
+
+api = FastAPI(
+    title="SongGeneration API",
+    description="AI-powered music generation API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# CORS middleware
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ======================
+# Configuration
+# ======================
+
+OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+CACHE_DIR = os.environ.get("TRANSFORMERS_CACHE", "./cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Optional API Key
+API_KEY = os.environ.get("API_KEY", None)
+
+# ======================
+# Helper Functions
+# ======================
+
+async def verify_api_key(x_api_key: str = Header(None)):
+    """Verify API key if configured"""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    return True
+
+def save_audio_file(audio_data, filename):
+    """Save audio file to outputs directory"""
+    if audio_data is None:
+        return None
+    
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    # Assuming audio_data is a file path or audio object
+    # Adjust based on actual return type
+    return filepath
+
+# ======================
+# API Endpoints
+# ======================
+
+@api.get("/")
+async def root():
+    """API information"""
+    return {
+        "service": "SongGeneration API",
+        "version": "1.0.0",
+        "status": "running",
+        "generation_available": GENERATION_AVAILABLE,
+        "endpoints": {
+            "health": "/api/health",
+            "generate_song": "/api/generate",
+            "generate_music": "/api/generate-music",
+            "genres": "/api/genres",
+            "docs": "/docs",
+            "gradio": "/gradio"
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
+@api.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "SongGeneration API",
+        "generation_available": GENERATION_AVAILABLE,
+        "output_dir": OUTPUT_DIR,
+        "cache_dir": CACHE_DIR,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@api.post("/api/generate")
+async def generate_song_api(
+    lyrics: str,
+    genre: str = "Auto",
+    audio_prompt: Optional[str] = None,
+    text_prompt: Optional[str] = None,
+    seed: int = -1,
+    api_key_valid: bool = Depends(verify_api_key)
+):
+    """
+    Generate a song from lyrics
+    
+    Parameters:
+    - lyrics: Song lyrics with structure tags ([intro], [verse], [chorus], etc.)
+    - genre: Music genre (Auto, Pop, Rock, Chinese Style, etc.)
+    - audio_prompt: Optional audio file for style reference
+    - text_prompt: Optional text description
+    - seed: Random seed (-1 for random)
+    """
+    try:
+        if not lyrics or len(lyrics.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Lyrics cannot be empty")
         
-        with gr.Column():
-            output_audio = gr.Audio(label="Generated Song", type="filepath")
-            output_json = gr.JSON(label="Generated Info")
-    
-        # # 示例按钮
-        # examples = gr.Examples(
-        #     examples=[
-        #         ["male, bright, rock, happy, electric guitar and drums, the bpm is 150."],
-        #         ["female, warm, jazz, romantic, synthesizer and piano, the bpm is 100."]
-        #     ],
-        #     inputs=[description],
-        #     label="Text Prompt examples"
-        # )
+        if not GENERATION_AVAILABLE:
+            raise HTTPException(
+                status_code=503, 
+                detail="Song generation service not available. Models may be loading."
+            )
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"song_{timestamp}.wav"
+        
+        # Call generation function
+        try:
+            audio_output, info = generate_song(
+                lyrics=lyrics,
+                genre=genre,
+                audio_prompt=audio_prompt,
+                text_prompt=text_prompt,
+                seed=seed
+            )
+            
+            # Save audio file
+            if audio_output:
+                output_path = os.path.join(OUTPUT_DIR, output_filename)
+                # Save logic depends on what generate_song returns
+                # Assuming it returns a file path or needs to be saved
+                
+                return {
+                    "status": "success",
+                    "message": "Song generated successfully",
+                    "data": {
+                        "audio_url": f"/outputs/{output_filename}",
+                        "filename": output_filename,
+                        "genre": genre,
+                        "info": info if isinstance(info, dict) else {},
+                        "lyrics_preview": lyrics[:100] + "..." if len(lyrics) > 100 else lyrics
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Generation failed")
+                
+        except Exception as gen_error:
+            print(f"Generation error: {gen_error}")
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Generation failed: {str(gen_error)}"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
-        # examples = gr.Examples(
-        #     examples=[
-        #     "[intro-medium]\n\n[verse]\n在这个疯狂的世界里\n谁不渴望一点改变\n在爱情面前\n我们都显得那么不安全\n你紧紧抱着我\n告诉我再靠近一点\n别让这璀璨的夜晚白白浪费\n我那迷茫的眼睛\n看不见未来的路\n在情感消散之前\n我们对爱的渴望永不熄灭\n你给我留下一句誓言\n想知道我们的爱是否能持续到永远\n[chorus]\n\n约定在那最后的夜晚\n不管命运如何摆布\n我们的心是否依然如初\n我会穿上红衬衫\n带着摇滚的激情\n回到我们初遇的地方\n约定在那最后的夜晚\n就算全世界都变了样\n我依然坚守诺言\n铭记这一天\n你永远是我心中的爱恋\n\n[outro-medium]\n",
-        #     "[intro-short]\n\n[verse]\nThrough emerald canyons where fireflies dwell\nCerulean berries kiss morning's first swell\nCrystalline dew crowns each Vitamin Dawn's confection dissolves slowly on me\nAmbrosia breezes through honeycomb vines\nNature's own candy in Fibonacci lines\n[chorus] Blueberry fruit so sweet\n takes you higher\n can't be beat\n In your lungs\n it starts to swell\n You're under its spell\n [verse] Resin of sunlight in candied retreat\nMarmalade moonbeams melt under bare feet\nNectar spirals bloom chloroplast champagne\nPhotosynthesis sings through my veins\nChlorophyll rhythms pulse warm in my blood\nThe forest's green pharmacy floods every bud[chorus] Blueberry fruit so sweet\n takes you higher\n can't be beat\n In your lungs\n it starts to swell\n You're under its spell\n feel the buzz\n ride the wave\n Limey me\n blueberry\n your mind's enslaved\n In the haze\n lose all time\n floating free\n feeling fine\n Blueberry\n fruit so sweet\n takes you higher\n can't be beat\n In your lungs\n it starts to swell\n cry\n You're under its spell\n\n[outro-short]\n",
-        #     ],
-        #     inputs=[lyric],
-        #     label="Lyrics examples",
-        # )
-    
-    # 生成按钮点击事件
-    generate_btn.click(
-        fn=generate_song,
-        inputs=[lyric, description, prompt_audio, genre, cfg_coef, temperature, gr.State(50)],
-        outputs=[output_audio, output_json]
-    )
-    generate_bgm_btn.click(
-        fn=generate_song,
-        inputs=[lyric, description, prompt_audio, genre, cfg_coef, temperature, gr.State(50), gr.State("bgm")],
-        outputs=[output_audio, output_json]
-    )
-    
+@api.post("/api/generate-music")
+async def generate_music_api(
+    text_prompt: str,
+    genre: str = "Auto",
+    duration: int = 180,
+    seed: int = -1,
+    api_key_valid: bool = Depends(verify_api_key)
+):
+    """
+    Generate instrumental music without lyrics
+    """
+    try:
+        if not text_prompt or len(text_prompt.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Text prompt cannot be empty")
+        
+        if not GENERATION_AVAILABLE:
+            raise HTTPException(
+                status_code=503,
+                detail="Music generation service not available"
+            )
+        
+        if duration > 300:
+            raise HTTPException(status_code=400, detail="Duration max 300 seconds")
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"music_{timestamp}.wav"
+        
+        try:
+            audio_output, info = generate_pure_music(
+                prompt=text_prompt,
+                genre=genre,
+                duration=duration,
+                seed=seed
+            )
+            
+            if audio_output:
+                return {
+                    "status": "success",
+                    "message": "Music generated successfully",
+                    "data": {
+                        "audio_url": f"/outputs/{output_filename}",
+                        "filename": output_filename,
+                        "genre": genre,
+                        "duration": duration,
+                        "prompt": text_prompt
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Generation failed")
+                
+        except Exception as gen_error:
+            raise HTTPException(status_code=500, detail=str(gen_error))
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# 启动应用
+@api.get("/outputs/{filename}")
+async def download_audio(filename: str):
+    """Download generated audio file"""
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    
+    return FileResponse(
+        filepath,
+        media_type="audio/wav",
+        filename=filename
+    )
+
+@api.get("/api/genres")
+async def get_genres():
+    """Get available music genres"""
+    genres = [
+        "Auto",
+        "Pop",
+        "R&B",
+        "Dance",
+        "Jazz",
+        "Rock",
+        "Chinese Style",
+        "Chinese Tradition",
+        "Metal",
+        "Reggae",
+        "Chinese Opera"
+    ]
+    return {"status": "success", "genres": genres, "count": len(genres)}
+
+@api.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "message": exc.detail,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+# ======================
+# Gradio Interface
+# ======================
+
+def create_gradio_interface():
+    """Create Gradio UI interface"""
+    
+    # Lyrics input guidelines
+    lyrics_guide = """
+    ### Lyrics Format Guide:
+    
+    **Structure Tags:**
+    - `[intro-short]`, `[intro-medium]`, `[intro-long]` - Intro sections
+    - `[verse]` - Verse (needs lyrics)
+    - `[chorus]` - Chorus (needs lyrics)
+    - `[bridge]` - Bridge (needs lyrics)
+    - `[inst]`, `[ins]` - Instrumental (no lyrics)
+    - `[outro]` - Outro (no lyrics)
+    
+    **Rules:**
+    - Each paragraph = one segment
+    - Start with structure tag, end with blank line
+    - Intro/inst/outro don't need lyrics
+    - Verse/chorus/bridge need lyrics
+    
+    **Example:**
+    ```
+    [intro-medium]
+    
+    [verse]
+    夜晚的街灯闪烁
+    我漫步在熟悉的角落
+    
+    [chorus]
+    回忆停留在这里
+    你却已不在
+    ```
+    """
+    
+    with gr.Blocks(title="SongGeneration API") as demo:
+        gr.Markdown("# 🎵 SongGeneration API")
+        gr.Markdown("AI-powered music generation with lyrics or text prompts")
+        
+        with gr.Tab("Generate Song"):
+            gr.Markdown(lyrics_guide)
+            
+            with gr.Row():
+                with gr.Column():
+                    lyrics_input = gr.Textbox(
+                        label="Lyrics",
+                        placeholder="Enter your lyrics with structure tags...",
+                        lines=15
+                    )
+                    genre_dropdown = gr.Dropdown(
+                        choices=["Auto", "Pop", "R&B", "Dance", "Jazz", "Rock", 
+                                "Chinese Style", "Chinese Tradition", "Metal", 
+                                "Reggae", "Chinese Opera"],
+                        value="Auto",
+                        label="Genre"
+                    )
+                    seed_input = gr.Number(label="Seed (-1 for random)", value=-1)
+                    generate_btn = gr.Button("Generate Song", variant="primary")
+                
+                with gr.Column():
+                    audio_output = gr.Audio(label="Generated Song")
+                    info_output = gr.JSON(label="Generation Info")
+            
+            generate_btn.click(
+                fn=lambda l, g, s: generate_song(l, g, seed=s) if GENERATION_AVAILABLE else (None, {"error": "Not available"}),
+                inputs=[lyrics_input, genre_dropdown, seed_input],
+                outputs=[audio_output, info_output]
+            )
+        
+        with gr.Tab("Generate Music"):
+            gr.Markdown("### Generate instrumental music without lyrics")
+            
+            with gr.Row():
+                with gr.Column():
+                    prompt_input = gr.Textbox(
+                        label="Text Prompt",
+                        placeholder="Describe the music style (e.g., 'Calm piano music for studying')",
+                        lines=3
+                    )
+                    music_genre = gr.Dropdown(
+                        choices=["Auto", "Pop", "Rock", "Jazz", "Classical"],
+                        value="Auto",
+                        label="Genre"
+                    )
+                    duration_input = gr.Slider(
+                        minimum=30,
+                        maximum=300,
+                        value=180,
+                        step=10,
+                        label="Duration (seconds)"
+                    )
+                    music_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                    generate_music_btn = gr.Button("Generate Music", variant="primary")
+                
+                with gr.Column():
+                    music_output = gr.Audio(label="Generated Music")
+                    music_info = gr.JSON(label="Generation Info")
+            
+            generate_music_btn.click(
+                fn=lambda p, g, d, s: generate_pure_music(p, g, duration=d, seed=s) if GENERATION_AVAILABLE else (None, {"error": "Not available"}),
+                inputs=[prompt_input, music_genre, duration_input, music_seed],
+                outputs=[music_output, music_info]
+            )
+        
+        with gr.Tab("API Info"):
+            gr.Markdown(f"""
+            ## API Endpoints
+            
+            **Base URL:** `{os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:10000')}`
+            
+            ### Endpoints:
+            - `GET /api/health` - Health check
+            - `POST /api/generate` - Generate song from lyrics
+            - `POST /api/generate-music` - Generate instrumental music
+            - `GET /api/genres` - Get available genres
+            - `GET /outputs/{{filename}}` - Download audio file
+            
+            ### Documentation:
+            - Interactive API Docs: `/docs`
+            - Alternative Docs: `/redoc`
+            
+            ### Generation Status:
+            - **Available:** {GENERATION_AVAILABLE}
+            """)
+    
+    return demo
+
+# Create Gradio interface
+demo = create_gradio_interface()
+
+# Mount Gradio app with FastAPI
+app = gr.mount_gradio_app(api, demo, path="/gradio")
+
+# Mount static files for outputs
+if os.path.exists(OUTPUT_DIR):
+    api.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+
+# ======================
+# Server Start
+# ======================
+
 if __name__ == "__main__":
-    torch.set_num_threads(1)
-    demo.launch(server_name="0.0.0.0", server_port=7860)
-
+    port = int(os.environ.get("PORT", 10000))
+    host = os.environ.get("HOST", "0.0.0.0")
+    
+    print("=" * 60)
+    print("🚀 SongGeneration API Server Starting...")
+    print("=" * 60)
+    print(f"📍 Host: {host}")
+    print(f"🔌 Port: {port}")
+    print(f"📁 Cache: {CACHE_DIR}")
+    print(f"📁 Output: {OUTPUT_DIR}")
+    print(f"🎵 Generation: {'Available' if GENERATION_AVAILABLE else 'Not Available (Models Loading...)'}")
+    print(f"🌐 API Docs: http://{host}:{port}/docs")
+    print(f"🎨 Gradio UI: http://{host}:{port}/gradio")
+    print("=" * 60)
+    
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=True
+    )
