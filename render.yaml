@@ -1,0 +1,40 @@
+services:
+  # Web Service - Main API
+  - type: web
+    name: song-generation-api
+    env: python
+    region: singapore  # Ya apni preferred region
+    plan: standard  # AI models ke liye minimum standard plan recommended
+    branch: main
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.0
+      - key: PORT
+        value: 10000
+      - key: TRANSFORMERS_CACHE
+        value: /opt/render/project/.cache
+      - key: HF_HOME
+        value: /opt/render/project/.cache
+      - key: GRADIO_SERVER_NAME
+        value: 0.0.0.0
+      - key: GRADIO_SERVER_PORT
+        value: 10000
+      # Optional: API Key for authentication
+      # - key: API_KEY
+      #   sync: false  # Set manually in Render dashboard
+    disk:
+      name: model-cache
+      mountPath: /opt/render/project/.cache
+      sizeGB: 10  # AI models ke liye storage
+    healthCheckPath: /api/health
+    autoDeploy: true
+
+# Alternative: Using Dockerfile
+# - type: web
+#   name: song-generation-api
+#   env: docker
+#   dockerfilePath: ./Dockerfile
+#   region: singapore
+#   plan: standard
